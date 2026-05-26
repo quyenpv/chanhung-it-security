@@ -1,0 +1,86 @@
+name: Update Manifest SHA256
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ps-agent/modules/**'
+      - 'ps-agent/manifest.json'
+
+permissions:
+  contents: write
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculate SHA256 for modules
+        id: calculate-sha
+        run: |
+          cd ps-agent/modules
+          
+          # Read manifest.json
+          MANIFEST_PATH="../manifest.json"
+          
+          # Calculate SHA256 for each module file
+          for module_file in *.ps1; do
+            if [ -f "$module_file" ]; then
+              sha256=$(sha256sum "$module_file" | cut -d' ' -f1)
+              module_name="${module_file%.ps1}"
+              echo "Module: $module_name, SHA256: $sha256"
+              
+              # Update manifest.json using jq
+              if command -v jq &> /dev/null; then
+                jq --arg name "$module_name" --arg sha "$sha256" \
+                   '.modules[$name].sha256 = $sha' "$MANIFEST_PATH" > tmp.json && mv tmp.json "$MANIFEST_PATH"
+              else
+                # Fallback using Python
+                python3 << EOF
+          import json
+          import sys
+          
+          with open('$MANIFEST_PATH', 'r') as f:
+              manifest = json.load(f)
+          
+          module_name = '$module_name'
+          sha256 = '$sha256'
+          
+          if module_name in manifest['modules']:
+              manifest['modules'][module_name]['sha256'] = sha256
+              with open('$MANIFEST_PATH', 'w') as f:
+                  json.dump(manifest, f, indent=2)
+          EOF
+              fi
+            fi
+          done
+
+      - name: Update lastUpdated timestamp
+        run: |
+          cd ps-agent
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          if command -v jq &> /dev/null; then
+            jq --arg ts "$timestamp" '.lastUpdated = $ts' manifest.json > tmp.json && mv tmp.json manifest.json
+          else
+            python3 << EOF
+          import json
+          with open('manifest.json', 'r') as f:
+              manifest = json.load(f)
+          manifest['lastUpdated'] = '$timestamp'
+          with open('manifest.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          EOF
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add ps-agent/manifest.json
+          git diff --staged --quiet || git commit -m "chore: auto-update manifest.json with SHA256 hashes"
+          git push
