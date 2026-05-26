@@ -37,6 +37,15 @@
       "enabled": true,
       "priority": "high",
       "target": "*"
+    },
+    "Module-ReportCollector": {
+      "filename": "Module-ReportCollector.ps1",
+      "version": "1.0.0",
+      "sha256": "cf93fdc245cb5ab4fc2a221986e96c2a02a361dd67d8d552a2058efb0b60cf2a",
+      "description": "Thu thập báo cáo từ các máy client về central server",
+      "enabled": true,
+      "priority": "medium",
+      "target": "*"
     }
   },
   "commands": {

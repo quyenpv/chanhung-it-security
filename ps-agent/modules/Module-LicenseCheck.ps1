@@ -19,7 +19,7 @@ param([switch]$Silent, [switch]$ReportOnly)
 $LC = @{
     LogPath      = "C:\ChanHung\Logs\LicenseCheck.log"
     ReportPath   = "C:\ChanHung\Logs\LicenseReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-    SheetWebhook = ""   # Điền webhook nếu muốn gửi Sheets riêng
+    SheetWebhook = $env:CHANHUNG_SHEETS_WEBHOOK   # Đọc từ biến môi trường
 }
 
 # Tên / pattern các tool crack phổ biến
