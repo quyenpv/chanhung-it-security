@@ -28,6 +28,15 @@
       "enabled": false,
       "priority": "medium",
       "target": "*"
+    },
+    "Module-LicenseCheck": {
+      "filename": "Module-LicenseCheck.ps1",
+      "version": "1.0.0",
+      "sha256": "590f6f5e8ad9259432d974f26f4cf535d443c98a6c29253c233a6909eb37be8a",
+      "description": "Kiểm tra phần mềm có bản quyền hợp lệ hay bị crack",
+      "enabled": true,
+      "priority": "high",
+      "target": "*"
     }
   },
   "commands": {
