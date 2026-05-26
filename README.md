@@ -1,10 +1,20 @@
-# ChanHung IT Security - Auto-Update Agent
+# ChanHung IT Security
 
-Hệ thống agent tự động cập nhật và cài đặt các module bảo mật từ GitHub xuống các máy client.
+Hệ thống bảo mật IT cho Chấn Hưng Holding bao gồm:
+- **ChanHung_IT_Setup.ps1**: Script cài đặt bảo mật và kiểm tra bản quyền (chạy thủ công)
+- **ps-agent**: Hệ thống agent tự động cập nhật từ GitHub (chạy tự động)
 
 ## Tổng quan
 
-Hệ thống cho phép:
+### ChanHung_IT_Setup.ps1
+Script cài đặt bảo mật và kiểm tra bản quyền cho máy tính:
+- Chặn tự động cài đặt phần mềm
+- Cấu hình IP Static
+- Kiểm tra bản quyền phần mềm (phát hiện crack tools)
+- Gửi báo cáo lên Google Sheets
+
+### ps-agent
+Hệ thống agent tự động cập nhật và cài đặt các module bảo mật từ GitHub:
 - Tự động pull code mới từ GitHub
 - Tự động cài đặt lại khi có thay đổi
 - Thực thi các module bảo mật theo lịch
@@ -20,15 +30,47 @@ ChanHung_IT_Security/
 │   ├── Push-Module.ps1              # Script push module lên GitHub
 │   ├── manifest.json                # Manifest quản lý modules và commands
 │   └── modules/                     # Thư mục chứa các module
-│       ├── Module-ITHardening.ps1
-│       ├── Module-BlockBrowserDownloads.ps1
-│       └── Module-USBControl.ps1
-├── ChanHung_IT_Install.ps1          # Script cài đặt chính
-├── ChanHung_IT_Setup.ps1            # Script setup
+│       ├── Module-LicenseCheck.ps1  # Kiểm tra bản quyền
+│       └── Module-ReportCollector.ps1 # Thu thập báo cáo
+├── ChanHung_IT_Setup.ps1            # Script setup bảo mật (chạy thủ công)
 └── .github/
     └── workflows/
         └── update-manifest.yml      # GitHub Actions tự động update SHA256
 ```
+
+## Sử dụng ChanHung_IT_Setup.ps1
+
+### Yêu cầu
+- Windows 10/11 hoặc Windows Server
+- Quyền Administrator
+- PowerShell ExecutionPolicy: Bypass
+
+### Cách chạy
+
+```powershell
+# Chạy bình thường (tất cả các bước)
+PowerShell -ExecutionPolicy Bypass -File ChanHung_IT_Setup.ps1
+
+# Bỏ qua cấu hình mạng
+PowerShell -ExecutionPolicy Bypass -File ChanHung_IT_Setup.ps1 -SkipNetworkConfig
+
+# Bỏ qua kiểm tra bản quyền
+PowerShell -ExecutionPolicy Bypass -File ChanHung_IT_Setup.ps1 -SkipLicenseCheck
+
+# Chạy silent mode (không hỏi, dùng tham số)
+PowerShell -ExecutionPolicy Bypass -File ChanHung_IT_Setup.ps1 -Silent -SkipLicenseCheck
+```
+
+### Các bước thực hiện
+1. Chặn tự động cài đặt phần mềm (MSI, Store, AutoRun)
+2. Cấu hình IP Static
+3. Kiểm tra bản quyền phần mềm (phát hiện crack tools)
+4. Gửi báo cáo lên Google Sheets
+
+### Báo cáo
+- Báo cáo local: `C:\Users\USERNAME\Desktop\ChanHung_IT_Report_MACHINENAME.txt`
+- Log license check: `C:\ChanHung\Logs\LicenseCheck.log`
+- Báo cáo license: `C:\ChanHung\Logs\LicenseReport_YYYYMMDD_HHmmss.txt`
 
 ## Cài đặt Agent trên Client
 
@@ -140,35 +182,28 @@ File log theo ngày: `agent-YYYYMMDD.log`
 
 ## Theo Dõi Kết Quả LicenseCheck
 
-### Cách 1: Xem log trên từng máy client
+Kết quả kiểm tra bản quyền được lưu trong:
+- `C:\ChanHung\Logs\LicenseCheck.log` - Log chi tiết từng lần quét
+- `C:\ChanHung\Logs\LicenseReport_YYYYMMDD_HHmmss.txt` - Báo cáo chi tiết
+
+### Xem kết quả
 
 ```powershell
 # Xem log LicenseCheck
 Get-Content "C:\ChanHung\Logs\LicenseCheck.log" -Tail 50
 
 # Xem báo cáo chi tiết mới nhất
-Get-ChildItem "C:\ChanHung\Logs\LicenseReport_*.txt" | 
-    Sort-Object LastWriteTime -Descending | 
-    Select-Object -First 1 | 
+Get-ChildItem "C:\ChanHung\Logs\LicenseReport_*.txt" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1 |
     Get-Content
 ```
 
-### Cách 2: Cấu hình Google Sheets (Tùy chọn)
+### Thu thập báo cáo từ nhiều máy
 
-Để gửi kết quả về Google Sheets:
+Sử dụng Module-ReportCollector trong ps-agent để thu thập báo cáo từ tất cả máy về central server:
 
-1. Tạo Google Apps Script Webhook
-2. Đặt biến môi trường trên client:
-   ```powershell
-   [System.Environment]::SetEnvironmentVariable("CHANHUNG_SHEETS_WEBHOOK", "your_webhook_url", "Machine")
-   ```
-3. Module-LicenseCheck sẽ tự động gửi kết quả
-
-### Cách 3: Sử dụng Module-ReportCollector (Khuyên dùng)
-
-Để thu thập báo cáo từ tất cả máy về central server:
-
-1. Cấu hình central server trong `Module-ReportCollector.ps1`:
+1. Cấu hình central server trong `ps-agent/modules/Module-ReportCollector.ps1`:
    ```powershell
    $RC = @{
        CentralServer = "\\YOUR-SERVER\ChanHung\Reports"
@@ -187,33 +222,11 @@ Get-ChildItem "C:\ChanHung\Logs\LicenseReport_*.txt" |
    Get-ChildItem "\\SERVER\ChanHung\Reports\" | Select-Object Name
 
    # Xem báo cáo LicenseCheck của một máy
-   Get-ChildItem "\\SERVER\ChanHung\Reports\MACHINENAME\LicenseCheck_*.txt" | 
-       Sort-Object LastWriteTime -Descending | 
-       Select-Object -First 1 | 
+   Get-ChildItem "\\SERVER\ChanHung\Reports\MACHINENAME\LicenseCheck_*.txt" |
+       Sort-Object LastWriteTime -Descending |
+       Select-Object -First 1 |
        Get-Content
    ```
-
-### Cách 4: Tạo script tổng hợp báo cáo
-
-Tạo script `Get-LicenseStatus.ps1` trên central server:
-
-```powershell
-$reportPath = "\\SERVER\ChanHung\Reports"
-$allMachines = Get-ChildItem $reportPath
-
-foreach ($machine in $allMachines) {
-    $latestReport = Get-ChildItem "$($machine.FullName)\LicenseCheck_*.txt" | 
-        Sort-Object LastWriteTime -Descending | 
-        Select-Object -First 1
-    
-    if ($latestReport) {
-        Write-Host "=== $($machine.Name) ===" -ForegroundColor Cyan
-        Write-Host "Last scan: $($latestReport.LastWriteTime)"
-        Get-Content $latestReport.FullName | Select-String "Kết quả|Crack|Cảnh báo"
-        Write-Host ""
-    }
-}
-```
 
 ## Cấu hình Thời gian Kiểm tra
 

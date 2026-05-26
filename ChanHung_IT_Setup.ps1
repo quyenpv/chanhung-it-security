@@ -1,10 +1,10 @@
 ﻿# ============================================================
 #  CHẤN HƯNG HOLDING - IT HARDENING & ASSET REGISTRATION
-#  Version  : 3.0  (+ GitHub Auto-Update Agent)
+#  Version  : 3.0
 #  Mục đích : 1) Chặn tự động cài phần mềm
 #             2) Thiết lập IP Static
 #             3) Gửi thông tin máy lên Google Sheets
-#             4) Cài GitHub Agent tự cập nhật policy
+#             4) Kiểm tra bản quyền phần mềm
 # ------------------------------------------------------------
 #  YÊU CẦU  : Chạy với quyền Administrator
 #  Lệnh chạy:
@@ -31,13 +31,7 @@ param(
     [switch]$SkipSecurityHardening,  # Bỏ qua chặn phần mềm
     [switch]$SkipReporting,          # Bỏ qua gửi báo cáo
     [switch]$SkipLicenseCheck,       # Bỏ qua kiểm tra bản quyền
-    [switch]$Silent,                 # Không hỏi, dùng giá trị mặc định / param
-
-    # ── GitHub Agent ──
-    [string]$GitHubOwner  = "chanhung-it",
-    [string]$GitHubRepo   = "ps-agent",
-    [string]$GitHubBranch = "main",
-    [switch]$SkipAgent                # Bỏ qua bước cài Agent
+    [switch]$Silent                  # Không hỏi, dùng giá trị mặc định / param
 )
 
 # ============================================================
@@ -1097,223 +1091,8 @@ function Write-LocalReport {
 }
 
 # ─────────────────────────────────────────────────────────────
-#  GITHUB AGENT — BIẾN & TOKEN
-# ─────────────────────────────────────────────────────────────
-
-$script:AgentBaseDir   = "C:\ChanHung\Agent"
-$script:AgentTokenFile = "C:\ChanHung\Agent\.token"
-$script:AgentModsDir   = "C:\ChanHung\Agent\Modules"
-$script:AgentVerFile   = "C:\ChanHung\Agent\version.json"
-$script:AgentLogFile   = "C:\ChanHung\Logs\Agent.log"
-$script:AgentTaskName  = "ChanHung-IT-Agent"
-$script:GH_API         = "https://api.github.com/repos/$GitHubOwner/$GitHubRepo/contents"
-
-function Save-AgentToken {
-    param([string]$PlainToken)
-    $enc = $PlainToken | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
-    foreach ($d in @($script:AgentBaseDir, "C:\ChanHung\Logs")) {
-        if (-not (Test-Path $d)) { New-Item -ItemType Directory $d -Force | Out-Null }
-    }
-    $enc | Out-File $script:AgentTokenFile -Encoding UTF8 -Force
-    attrib +h +s $script:AgentTokenFile
-}
-
-function Get-AgentToken {
-    if (-not (Test-Path $script:AgentTokenFile)) { return $null }
-    try {
-        $sec  = Get-Content $script:AgentTokenFile | ConvertTo-SecureString
-        $cred = New-Object PSCredential("x", $sec)
-        return $cred.GetNetworkCredential().Password
-    } catch { return $null }
-}
-
-# ─────────────────────────────────────────────────────────────
-#  GITHUB AGENT — HTTP & HASH
-# ─────────────────────────────────────────────────────────────
-
-function Invoke-GitHubAPI {
-    param([string]$RepoPath, [string]$OutFile = $null, [string]$Token)
-    $url = "$script:GH_API/$RepoPath`?ref=$GitHubBranch"
-    $hdr = @{
-        "Authorization"        = "Bearer $Token"
-        "Accept"               = "application/vnd.github.v3.raw"
-        "User-Agent"           = "ChanHung-Agent/$env:COMPUTERNAME"
-        "X-GitHub-Api-Version" = "2022-11-28"
-    }
-    try {
-        if ($OutFile) {
-            Invoke-WebRequest -Uri $url -Headers $hdr -OutFile $OutFile `
-                -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
-            return $true
-        }
-        $r = Invoke-WebRequest -Uri $url -Headers $hdr -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        return ($r.Content | ConvertFrom-Json)
-    } catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        if     ($code -eq 401) { Write-Err  "GitHub: Token hết hạn hoặc sai!" }
-        elseif ($code -eq 404) { Write-Warn "GitHub: Không tìm thấy '$RepoPath' trên repo" }
-        else                   { Write-Err  "GitHub API lỗi [$RepoPath]: $_" }
-        return $null
-    }
-}
-
-function Get-SHA256 { param([string]$Path)
-    return (Get-FileHash $Path -Algorithm SHA256).Hash
-}
-function Test-SHA256 { param([string]$Path, [string]$Expected)
-    $actual = Get-SHA256 $Path
-    if ($actual -ne $Expected.ToUpper()) {
-        Write-Err "Hash KHÔNG KHỚP: $([System.IO.Path]::GetFileName($Path))"
-        return $false
-    }
-    return $true
-}
-
-# ─────────────────────────────────────────────────────────────
-#  GITHUB AGENT — SELF-UPDATE (script tự cập nhật chính nó)
-# ─────────────────────────────────────────────────────────────
-
-function Invoke-SelfUpdate {
-    $token = Get-AgentToken
-    if (-not $token) { return }   # Chưa cài agent — bỏ qua
-
-    $manifest = Invoke-GitHubAPI -RepoPath "manifest.json" -Token $token
-    if (-not $manifest) { return }
-
-    $selfEntry = $manifest.modules | Where-Object { $_.name -eq "ChanHung_IT_Setup" }
-    if (-not $selfEntry) { return }
-
-    $localVer = if (Test-Path $script:AgentVerFile) {
-        try { (Get-Content $script:AgentVerFile | ConvertFrom-Json).self_version } catch { "0.0.0" }
-    } else { "0.0.0" }
-
-    if ($selfEntry.version -eq $localVer) { return }   # Đang dùng bản mới nhất
-
-    Write-Info "Phát hiện phiên bản mới v$($selfEntry.version) — đang tải..."
-    $tmp = Join-Path $env:TEMP "ChanHung_IT_Setup_new.ps1"
-    $ok  = Invoke-GitHubAPI -RepoPath "modules/ChanHung_IT_Setup.ps1" -OutFile $tmp -Token $token
-    if (-not $ok) { return }
-    if (-not (Test-SHA256 $tmp $selfEntry.sha256)) {
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        return
-    }
-
-    Copy-Item $tmp $PSCommandPath -Force
-    Remove-Item $tmp -Force
-
-    # Lưu version mới
-    $ver = if (Test-Path $script:AgentVerFile) {
-        try { Get-Content $script:AgentVerFile | ConvertFrom-Json } catch { [PSCustomObject]@{ version="0.0.0"; self_version="0.0.0"; modules=@{} } }
-    } else { [PSCustomObject]@{ version="0.0.0"; self_version="0.0.0"; modules=@{} } }
-    $ver | Add-Member -NotePropertyName "self_version" -NotePropertyValue $selfEntry.version -Force
-    $ver | ConvertTo-Json -Depth 5 | Out-File $script:AgentVerFile -Encoding UTF8 -Force
-
-    Write-OK "Đã cập nhật script lên v$($selfEntry.version) — khởi động lại..."
-    Start-Sleep -Seconds 2
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @($PSBoundParameters.GetEnumerator() | ForEach-Object { "-$($_.Key)"; if ($_.Value -isnot [switch]) { $_.Value } })
-    exit
-}
-
-# ─────────────────────────────────────────────────────────────
-#  GITHUB AGENT — CÀI ĐẶT SCHEDULED TASK
-# ─────────────────────────────────────────────────────────────
-
-function Install-GitHubAgent {
-    param([string]$Token)
-
-    Write-Step "BƯỚC 5: Cài GitHub Auto-Update Agent"
-
-    # Kiểm tra token
-    Write-Info "Kiểm tra kết nối GitHub..."
-    $manifest = Invoke-GitHubAPI -RepoPath "manifest.json" -Token $Token
-    if (-not $manifest) {
-        Write-Err "Không kết nối được GitHub. Kiểm tra lại token và tên repo."
-        return $false
-    }
-    Write-OK "GitHub OK — Manifest v$($manifest.version)"
-
-    # Lưu token encrypted
-    Save-AgentToken $Token
-    Write-OK "Token đã lưu encrypted (DPAPI — chỉ đọc được trên máy này)"
-
-    # Tạo thư mục
-    foreach ($d in @($script:AgentBaseDir, $script:AgentModsDir, "C:\ChanHung\Logs")) {
-        if (-not (Test-Path $d)) { New-Item -ItemType Directory $d -Force | Out-Null }
-    }
-
-    # Tải ChanHung-Agent.ps1 từ GitHub
-    $agentDest  = Join-Path $script:AgentBaseDir "ChanHung-Agent.ps1"
-    $agentEntry = $manifest.modules | Where-Object { $_.name -eq "ChanHung-Agent" }
-
-    if ($agentEntry) {
-        $tmp = Join-Path $env:TEMP "ChanHung-Agent_dl.ps1"
-        $ok  = Invoke-GitHubAPI -RepoPath "modules/ChanHung-Agent.ps1" -OutFile $tmp -Token $Token
-        if ($ok -and (Test-SHA256 $tmp $agentEntry.sha256)) {
-            Move-Item $tmp $agentDest -Force
-            Write-OK "Đã tải ChanHung-Agent.ps1 từ GitHub"
-        } else {
-            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-            Write-Warn "Không tải được agent — dùng self-run mode"
-            # Stub: agent gọi lại script chính ở chế độ silent
-            "powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Silent -SkipAgent" |
-                Out-File $agentDest -Encoding UTF8 -Force
-        }
-    } else {
-        Write-Warn "ChanHung-Agent chưa có trong manifest — dùng self-run mode"
-        "powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Silent -SkipAgent" |
-            Out-File $agentDest -Encoding UTF8 -Force
-    }
-
-    # Tạo Scheduled Task — chạy với SYSTEM mỗi 15 phút
-    $action = New-ScheduledTaskAction `
-        -Execute  "powershell.exe" `
-        -Argument "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$agentDest`""
-
-    $trigger = New-ScheduledTaskTrigger `
-        -RepetitionInterval (New-TimeSpan -Minutes 15) `
-        -Once -At (Get-Date)
-
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId    "NT AUTHORITY\SYSTEM" `
-        -LogonType ServiceAccount `
-        -RunLevel  Highest
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -ExecutionTimeLimit    (New-TimeSpan -Minutes 5) `
-        -StartWhenAvailable `
-        -RunOnlyIfNetworkAvailable `
-        -RestartCount          3 `
-        -RestartInterval       (New-TimeSpan -Minutes 2)
-
-    Unregister-ScheduledTask -TaskName $script:AgentTaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Register-ScheduledTask `
-        -TaskName    $script:AgentTaskName `
-        -Action      $action `
-        -Trigger     $trigger `
-        -Principal   $principal `
-        -Settings    $settings `
-        -Description "Chấn Hưng IT Agent — tự cập nhật policy từ GitHub" | Out-Null
-
-    # Ẩn thư mục agent
-    attrib +h +s $script:AgentBaseDir
-
-    # Kích hoạt ngay
-    Start-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue
-
-    Write-OK "Agent đã cài và kích hoạt!"
-    Write-Info "Scheduled Task '$($script:AgentTaskName)' — tự chạy mỗi 15 phút"
-    Write-Info "Từ nay chỉ cần push module lên GitHub, máy này tự cập nhật."
-    return $true
-}
-
-# ─────────────────────────────────────────────────────────────
 #  CHƯƠNG TRÌNH CHÍNH
 # ─────────────────────────────────────────────────────────────
-
-# Tự kiểm tra update từ GitHub (chỉ chạy khi đã cài agent)
-try { Invoke-SelfUpdate } catch { <# không block wizard nếu lỗi #> }
-
-
 
 # ── Fetch whitelist từ Google Sheets ──
 Write-Info "Đang đọc danh sách whitelist từ Google Sheets..."
@@ -1355,14 +1134,6 @@ if (-not $Silent) {
     if (-not $SkipNetworkConfig) { Write-Host "    [2] Cấu hình IP Static"            -ForegroundColor White }
     if (-not $SkipLicenseCheck)  { Write-Host "    [3] Kiểm tra bản quyền phần mềm" -ForegroundColor White }
     if (-not $SkipReporting)     { Write-Host "    [4] Gửi báo cáo lên Google Sheets" -ForegroundColor White }
-    $agentAlready = $null -ne (Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue)
-    if (-not $SkipAgent) {
-        if ($agentAlready) {
-            Write-Host "    [5] GitHub Agent         →  ✅ Đã cài (bỏ qua)" -ForegroundColor DarkGray
-        } else {
-            Write-Host "    [5] Cài GitHub Auto-Update Agent" -ForegroundColor Magenta
-        }
-    }
     Write-Host ""
 
     $confirm = Read-Host "  Tiếp tục? [Y/N]"
@@ -1431,34 +1202,6 @@ if (-not $SkipReporting) {
 
 Write-LocalReport -MachineInfo $machineInfo -NetworkInfo $netResult -SecurityInfo $secResult
 
-# ── Bước 5: Cài GitHub Agent ──
-$agentInstalled = $false
-if (-not $SkipAgent) {
-    $agentAlreadyInstalled = $null -ne (Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue)
-
-    if ($agentAlreadyInstalled) {
-        Write-Info "GitHub Agent đã cài trước đó — bỏ qua"
-        $agentInstalled = $true
-    } elseif (-not $Silent) {
-        Write-Host ""
-        Write-Host "  ┌─────────────────────────────────────────────────────┐" -ForegroundColor Magenta
-        Write-Host "  │  GITHUB AUTO-UPDATE AGENT                           │" -ForegroundColor Magenta
-        Write-Host "  │  Máy sẽ tự cập nhật policy qua GitHub mỗi 15 phút  │" -ForegroundColor Magenta
-        Write-Host "  │  Cần: GitHub PAT (Fine-grained, Contents: Read)     │" -ForegroundColor Magenta
-        Write-Host "  └─────────────────────────────────────────────────────┘" -ForegroundColor Magenta
-        Write-Host ""
-        $installAgent = Read-Host "  Cài GitHub Agent không? [Y/N]"
-        if ($installAgent -match "^[Yy]") {
-            $pat = Read-Host "  Nhập GitHub Personal Access Token (ghp_...)"
-            if ($pat -match "^(ghp_|github_pat_)") {
-                $agentInstalled = Install-GitHubAgent -Token $pat
-            } else {
-                Write-Warn "Token không đúng định dạng — bỏ qua bước này"
-            }
-        }
-    }
-}
-
 # ── Tổng kết ──
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor Green
@@ -1479,11 +1222,9 @@ $licenseDisplay = if ($licenseResult) {
     else { "✅ Hợp lệ                    " }
 } elseif ($SkipLicenseCheck) { "⏭️  Bỏ qua                   " } else { "⚠️  Chưa kiểm tra           " }
 $sheetDisplay = if ($sent)           { "✅ Thành công           " } else { "⚠️  Xem log local        " }
-$agentDisplay = if ($agentInstalled) { "✅ Đang chạy (15 phút)  " } elseif ($SkipAgent) { "⏭️  Bỏ qua               " } else { "⚠️  Chưa cài             " }
 Write-Host "  ║  IP Static          : $ipDisplay║" -ForegroundColor Green
 Write-Host "  ║  Kiểm tra bản quyền : $licenseDisplay║" -ForegroundColor $(if ($licenseResult -and $licenseResult.CrackCount -gt 0) {'Red'} elseif ($licenseResult -and $licenseResult.WarnCount -gt 0) {'Yellow'} else {'Green'})
 Write-Host "  ║  Gửi Google Sheets  : $sheetDisplay║" -ForegroundColor Green
-Write-Host "  ║  GitHub Agent       : $agentDisplay║" -ForegroundColor $(if ($agentInstalled) {'Green'} else {'DarkYellow'})
 Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 
