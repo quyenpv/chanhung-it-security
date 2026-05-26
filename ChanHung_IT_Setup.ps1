@@ -30,6 +30,7 @@ param(
     [switch]$SkipNetworkConfig,      # Bỏ qua cấu hình mạng
     [switch]$SkipSecurityHardening,  # Bỏ qua chặn phần mềm
     [switch]$SkipReporting,          # Bỏ qua gửi báo cáo
+    [switch]$SkipLicenseCheck,       # Bỏ qua kiểm tra bản quyền
     [switch]$Silent,                 # Không hỏi, dùng giá trị mặc định / param
 
     # ── GitHub Agent ──
@@ -593,7 +594,297 @@ function Get-MachineInfo {
 }
 
 # ─────────────────────────────────────────────────────────────
-#  BƯỚC 4: GỬI DỮ LIỆU LÊN GOOGLE SHEETS
+#  BƯỚC 4: KIỂM TRA BẢN QUYỀN PHẦN MỀM (LICENSE CHECK)
+# ─────────────────────────────────────────────────────────────
+
+function Invoke-LicenseCheck {
+    Write-Step "BƯỚC 4: Kiểm tra bản quyền phần mềm"
+
+    $LC = @{
+        LogPath      = "C:\ChanHung\Logs\LicenseCheck.log"
+        ReportPath   = "C:\ChanHung\Logs\LicenseReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    }
+
+    # Tạo thư mục log
+    $logDir = Split-Path $LC.LogPath
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory $logDir -Force | Out-Null }
+
+    function Write-LCLog {
+        param([string]$Msg, [string]$Level = "INFO")
+        $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')][$Level] $Msg"
+        Add-Content $LC.LogPath $line -Encoding UTF8
+        $col = switch ($Level) {
+            "OK"     { "Green" }
+            "WARN"   { "Yellow" }
+            "CRACK"  { "Red" }
+            "INFO"   { "Cyan" }
+            default  { "White" }
+        }
+        Write-Host "    [$Level] $Msg" -ForegroundColor $col
+    }
+
+    # Tên / pattern các tool crack phổ biến
+    $KnownCrackTools = @(
+        "KMSPico", "KMSAuto", "KMSActivator", "KMS_VL_ALL",
+        "AutoKMS", "MiniKMS", "KMSOffline", "KMSELDI",
+        "AAct", "AAct Network", "AIO Activator",
+        "Windows Loader", "Windows KMS Activator", "Daz Loader",
+        "RemoveWAT", "OEM7F7",
+        "Office Toolkit", "EZ-Activator", "Office Activator",
+        "Microsoft Toolkit", "HWIDGEN", "MAS", "Massgrave",
+        "Keygen", "KeyGen", "Key Generator",
+        "Patch.exe", "Crack.exe", "Loader.exe", "Bypass.exe",
+        "Serial Finder", "License Bypasser",
+        "Adobe Zii", "Adobe GenP", "GenP", "Zii",
+        "Defender Control", "Defender Remover", "Kill Defender"
+    )
+
+    # Tên file crack thường gặp
+    $SuspiciousFileNames = @(
+        "crack.exe", "keygen.exe", "patch.exe", "loader.exe",
+        "activator.exe", "bypass.exe", "unlocker.exe",
+        "serial.exe", "registration.exe",
+        "crack.dll", "patch.dll"
+    )
+
+    # Registry keys của crack tools
+    $CrackRegistryKeys = @(
+        "HKLM:\SOFTWARE\KMSAuto",
+        "HKLM:\SOFTWARE\KMSPico",
+        "HKLM:\SOFTWARE\AAct",
+        "HKCU:\SOFTWARE\KMSAuto",
+        "HKCU:\SOFTWARE\KMSPico",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\KMSELDI",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\KMSAuto"
+    )
+
+    # Lớp 1: Phát hiện tool crack
+    Write-LCLog "--- LỚP 1: Kiểm tra tool crack đã cài ---" "INFO"
+    $found = @()
+
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    foreach ($path in $regPaths) {
+        $items = Get-ItemProperty $path -ErrorAction SilentlyContinue
+        if (-not $items) { continue }
+        foreach ($item in @($items)) {
+            $name = Get-RegProp $item 'DisplayName'
+            if (-not $name) { continue }
+            foreach ($crack in $KnownCrackTools) {
+                if ($name -like "*$crack*") {
+                    $found += [PSCustomObject]@{
+                        Name      = $name
+                        Type      = "CrackTool"
+                        Risk      = "CRACK"
+                        Detail    = "Phần mềm crack đã cài: '$name'"
+                    }
+                    Write-LCLog "PHÁT HIỆN CRACK TOOL: $name" "CRACK"
+                }
+            }
+        }
+    }
+
+    # Kiểm tra process
+    $procs = Get-Process -ErrorAction SilentlyContinue
+    foreach ($proc in $procs) {
+        foreach ($crack in $KnownCrackTools) {
+            if ($proc.ProcessName -like "*$crack*" -or $proc.MainWindowTitle -like "*$crack*") {
+                $found += [PSCustomObject]@{
+                    Name   = $proc.ProcessName
+                    Type   = "CrackProcess"
+                    Risk   = "CRACK"
+                    Detail = "Process crack đang chạy: '$($proc.ProcessName)'"
+                }
+                Write-LCLog "CRACK TOOL ĐANG CHẠY: $($proc.ProcessName)" "CRACK"
+            }
+        }
+    }
+
+    # Kiểm tra Task Scheduler
+    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+        $_.TaskName -match "KMS|AAct|Activat|KMSELDI" -and $_.TaskName -ne "ChanHung-IT-Agent"
+    }
+    foreach ($task in $tasks) {
+        $found += [PSCustomObject]@{
+            Name   = $task.TaskName
+            Type   = "CrackScheduledTask"
+            Risk   = "CRACK"
+            Detail = "Scheduled Task nghi ngờ crack: '$($task.TaskName)'"
+        }
+        Write-LCLog "TASK CRACK: $($task.TaskName)" "CRACK"
+    }
+
+    if ($found.Count -eq 0) { Write-LCLog "Lớp 1 OK — Không phát hiện crack tool" "OK" }
+
+    # Lớp 2: Kiểm tra Registry crack
+    Write-LCLog "--- LỚP 2: Kiểm tra registry dấu hiệu crack ---" "INFO"
+    foreach ($key in $CrackRegistryKeys) {
+        if (Test-Path $key) {
+            $found += [PSCustomObject]@{
+                Name   = $key
+                Type   = "CrackRegistry"
+                Risk   = "CRACK"
+                Detail = "Registry key của crack tool: $key"
+            }
+            Write-LCLog "CRACK REGISTRY: $key" "CRACK"
+        }
+    }
+
+    # Lớp 3: Kiểm tra kích hoạt Windows & Office
+    Write-LCLog "--- LỚP 3: Kiểm tra kích hoạt Windows & Office ---" "INFO"
+
+    try {
+        $wmi = Get-WmiObject SoftwareLicensingProduct -ErrorAction Stop |
+            Where-Object { $_.Name -like "Windows*" -and $_.PartialProductKey }
+
+        $winStatus = switch ($wmi.LicenseStatus) {
+            1       { "Đã kích hoạt hợp lệ" }
+            2       { "Đang trong thời gian dùng thử" }
+            3       { "Đang trong thời gian gia hạn" }
+            4       { "Kênh không hợp lệ" }
+            5       { "Đã hết hạn" }
+            6       { "Tạm ngưng" }
+            default { "Chưa kích hoạt (Status: $($wmi.LicenseStatus))" }
+        }
+
+        $winRisk = if ($wmi.LicenseStatus -eq 1) { "OK" } else { "WARN" }
+        Write-LCLog "Windows: $winStatus" $winRisk
+
+        if ($wmi.LicenseStatus -ne 1) {
+            $found += [PSCustomObject]@{
+                Name   = "Windows"
+                Type   = "WindowsActivation"
+                Risk   = $winRisk
+                Detail = "Windows chưa kích hoạt hợp lệ: $winStatus"
+            }
+        }
+
+        # Kiểm tra KMS local
+        if ($wmi.DiscoveredKeyManagementServiceMachineIpAddress -eq "127.0.0.1" -or
+            $wmi.DiscoveredKeyManagementServiceMachineName -match "localhost|127.0.0.1") {
+            $found += [PSCustomObject]@{
+                Name   = "Windows KMS Local"
+                Type   = "KMSLocal"
+                Risk   = "CRACK"
+                Detail = "Windows kích hoạt qua KMS LOCAL (dấu hiệu crack điển hình!)"
+            }
+            Write-LCLog "KMS LOCAL PHÁT HIỆN: Windows kích hoạt qua 127.0.0.1!" "CRACK"
+        }
+    } catch {
+        Write-LCLog "Không đọc được trạng thái Windows: $_" "WARN"
+    }
+
+    # Office activation
+    try {
+        $officeWmi = Get-WmiObject SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "Microsoft Office*" -and $_.PartialProductKey }
+
+        foreach ($op in $officeWmi) {
+            if ($op.LicenseStatus -ne 1) {
+                $found += [PSCustomObject]@{
+                    Name   = $op.Name
+                    Type   = "OfficeActivation"
+                    Risk   = "WARN"
+                    Detail = "Office chưa kích hoạt: $($op.Name) (Status: $($op.LicenseStatus))"
+                }
+                Write-LCLog "Office chưa kích hoạt: $($op.Name)" "WARN"
+            } else {
+                Write-LCLog "Office OK: $($op.Name)" "OK"
+            }
+
+            if ($op.DiscoveredKeyManagementServiceMachineIpAddress -eq "127.0.0.1") {
+                $found += [PSCustomObject]@{
+                    Name   = $op.Name
+                    Type   = "OfficeKMSLocal"
+                    Risk   = "CRACK"
+                    Detail = "Office kích hoạt qua KMS LOCAL: $($op.Name)"
+                }
+                Write-LCLog "OFFICE KMS LOCAL: $($op.Name)" "CRACK"
+            }
+        }
+    } catch { }
+
+    # Tổng hợp báo cáo
+    $crackCount = @($found | Where-Object Risk -eq "CRACK").Count
+    $warnCount  = @($found | Where-Object Risk -eq "WARN").Count
+
+    $overallRisk = if     ($crackCount -gt 0) { "🔴 CRACK PHÁT HIỆN" }
+                  elseif ($warnCount  -gt 0) { "🟡 CẦN KIỂM TRA" }
+                  else                        { "🟢 HỢP LỆ" }
+
+    $report = [PSCustomObject]@{
+        Computer     = $env:COMPUTERNAME
+        User         = $env:USERNAME
+        ScanTime     = (Get-Date -Format "dd/MM/yyyy HH:mm:ss")
+        OverallRisk  = $overallRisk
+        CrackCount   = $crackCount
+        WarnCount    = $warnCount
+        Findings     = $found
+    }
+
+    # Lưu báo cáo
+    $sep = "=" * 60
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add($sep)
+    $lines.Add("  CHẤN HƯNG — BÁO CÁO KIỂM TRA BẢN QUYỀN")
+    $lines.Add("  Máy       : $($report.Computer)")
+    $lines.Add("  User      : $($report.User)")
+    $lines.Add("  Thời gian : $($report.ScanTime)")
+    $lines.Add("  Kết quả   : $($report.OverallRisk)")
+    $lines.Add("  Crack     : $($report.CrackCount) phát hiện  |  Cảnh báo: $($report.WarnCount)")
+    $lines.Add($sep)
+    $lines.Add("")
+
+    if ($report.Findings.Count -eq 0) {
+        $lines.Add("  Không phát hiện vấn đề bản quyền.")
+    } else {
+        $lines.Add("  CHI TIẾT:")
+        $lines.Add("")
+        foreach ($f in ($report.Findings | Sort-Object Risk -Descending)) {
+            $icon = switch ($f.Risk) {
+                "CRACK" { "[CRACK]" }
+                "WARN"  { "[WARN] " }
+                default { "[INFO] " }
+            }
+            $lines.Add("  $icon $($f.Detail)")
+        }
+    }
+
+    $lines.Add("")
+    $lines.Add($sep)
+    $lines | Out-File $LC.ReportPath -Encoding UTF8 -Force
+
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor $(
+        if ($report.CrackCount -gt 0) { "Red" } elseif ($report.WarnCount -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "  ║  KẾT QUẢ KIỂM TRA BẢN QUYỀN                ║"
+    Write-Host "  ║  $($report.OverallRisk.PadRight(44))║"
+    Write-Host "  ║  Crack: $($report.CrackCount)  |  Cảnh báo: $($report.WarnCount.ToString().PadRight(24))║"
+    Write-Host "  ╚══════════════════════════════════════════════╝"
+    Write-Host "  Báo cáo: $($LC.ReportPath)" -ForegroundColor Gray
+    Write-Host ""
+
+    if ($report.Findings.Count -gt 0) {
+        Write-Host "  CÁC VẤN ĐỀ PHÁT HIỆN:" -ForegroundColor Yellow
+        foreach ($f in ($report.Findings | Sort-Object Risk -Descending)) {
+            $col  = if ($f.Risk -eq "CRACK") { "Red" } else { "Yellow" }
+            $icon = if ($f.Risk -eq "CRACK") { "[CRACK]" } else { "[WARN] " }
+            Write-Host "    $icon $($f.Detail)" -ForegroundColor $col
+        }
+        Write-Host ""
+    }
+
+    Write-LCLog "=== HOÀN TẤT: $($report.OverallRisk) | Crack=$($report.CrackCount) Warn=$($report.WarnCount) ==="
+
+    return $report
+}
+
+# ─────────────────────────────────────────────────────────────
+#  BƯỚC 5: GỬI DỮ LIỆU LÊN GOOGLE SHEETS
 # ─────────────────────────────────────────────────────────────
 
 function Send-ToGoogleSheets {
@@ -603,7 +894,7 @@ function Send-ToGoogleSheets {
         [hashtable]$SecurityInfo
     )
 
-    Write-Step "BƯỚC 4: Gửi báo cáo lên Google Sheets"
+    Write-Step "BƯỚC 5: Gửi báo cáo lên Google Sheets"
 
     if ($GoogleScriptURL -like "*PASTE_YOUR*") {
         Write-Warn "Chưa cấu hình Google Script URL!"
@@ -730,7 +1021,7 @@ function Send-ToGoogleSheets {
 }
 
 # ─────────────────────────────────────────────────────────────
-#  BƯỚC 5: TẠO BÁO CÁO LOCAL
+#  BƯỚC 6: TẠO BÁO CÁO LOCAL
 # ─────────────────────────────────────────────────────────────
 
 function Write-LocalReport {
@@ -1062,7 +1353,8 @@ if (-not $Silent) {
         Write-Host "    [1] Chặn phần mềm  →  ⏭️  BỎ QUA (máy trong whitelist)" -ForegroundColor DarkYellow
     }
     if (-not $SkipNetworkConfig) { Write-Host "    [2] Cấu hình IP Static"            -ForegroundColor White }
-    if (-not $SkipReporting)     { Write-Host "    [3] Gửi báo cáo lên Google Sheets" -ForegroundColor White }
+    if (-not $SkipLicenseCheck)  { Write-Host "    [3] Kiểm tra bản quyền phần mềm" -ForegroundColor White }
+    if (-not $SkipReporting)     { Write-Host "    [4] Gửi báo cáo lên Google Sheets" -ForegroundColor White }
     $agentAlready = $null -ne (Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue)
     if (-not $SkipAgent) {
         if ($agentAlready) {
@@ -1127,6 +1419,12 @@ if (-not $SkipNetworkConfig) {
 
 $machineInfo = Get-MachineInfo
 
+# ── Bước 4: Kiểm tra bản quyền ──
+$licenseResult = $null
+if (-not $SkipLicenseCheck) {
+    $licenseResult = Invoke-LicenseCheck
+}
+
 if (-not $SkipReporting) {
     $sent = Send-ToGoogleSheets -MachineInfo $machineInfo -NetworkInfo $netResult -SecurityInfo $secResult
 }
@@ -1175,9 +1473,15 @@ if ($isExcluded) {
 }
 
 $ipDisplay    = if ($netResult.StaticIPSet) { "✅ $($netResult.IPAddress)".PadRight(22) } else { "⚠️  Giữ cấu hình cũ     " }
+$licenseDisplay = if ($licenseResult) {
+    if ($licenseResult.CrackCount -gt 0) { "🔴 Crack: $($licenseResult.CrackCount)".PadRight(22) }
+    elseif ($licenseResult.WarnCount -gt 0) { "🟡 Cảnh báo: $($licenseResult.WarnCount)".PadRight(22) }
+    else { "✅ Hợp lệ                    " }
+} elseif ($SkipLicenseCheck) { "⏭️  Bỏ qua                   " } else { "⚠️  Chưa kiểm tra           " }
 $sheetDisplay = if ($sent)           { "✅ Thành công           " } else { "⚠️  Xem log local        " }
 $agentDisplay = if ($agentInstalled) { "✅ Đang chạy (15 phút)  " } elseif ($SkipAgent) { "⏭️  Bỏ qua               " } else { "⚠️  Chưa cài             " }
 Write-Host "  ║  IP Static          : $ipDisplay║" -ForegroundColor Green
+Write-Host "  ║  Kiểm tra bản quyền : $licenseDisplay║" -ForegroundColor $(if ($licenseResult -and $licenseResult.CrackCount -gt 0) {'Red'} elseif ($licenseResult -and $licenseResult.WarnCount -gt 0) {'Yellow'} else {'Green'})
 Write-Host "  ║  Gửi Google Sheets  : $sheetDisplay║" -ForegroundColor Green
 Write-Host "  ║  GitHub Agent       : $agentDisplay║" -ForegroundColor $(if ($agentInstalled) {'Green'} else {'DarkYellow'})
 Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Green
