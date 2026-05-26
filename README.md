@@ -138,6 +138,83 @@ Log được lưu tại: `C:\Program Files\ChanHung\PS-Agent\logs\`
 
 File log theo ngày: `agent-YYYYMMDD.log`
 
+## Theo Dõi Kết Quả LicenseCheck
+
+### Cách 1: Xem log trên từng máy client
+
+```powershell
+# Xem log LicenseCheck
+Get-Content "C:\ChanHung\Logs\LicenseCheck.log" -Tail 50
+
+# Xem báo cáo chi tiết mới nhất
+Get-ChildItem "C:\ChanHung\Logs\LicenseReport_*.txt" | 
+    Sort-Object LastWriteTime -Descending | 
+    Select-Object -First 1 | 
+    Get-Content
+```
+
+### Cách 2: Cấu hình Google Sheets (Tùy chọn)
+
+Để gửi kết quả về Google Sheets:
+
+1. Tạo Google Apps Script Webhook
+2. Đặt biến môi trường trên client:
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable("CHANHUNG_SHEETS_WEBHOOK", "your_webhook_url", "Machine")
+   ```
+3. Module-LicenseCheck sẽ tự động gửi kết quả
+
+### Cách 3: Sử dụng Module-ReportCollector (Khuyên dùng)
+
+Để thu thập báo cáo từ tất cả máy về central server:
+
+1. Cấu hình central server trong `Module-ReportCollector.ps1`:
+   ```powershell
+   $RC = @{
+       CentralServer = "\\YOUR-SERVER\ChanHung\Reports"
+   }
+   ```
+
+2. Module-ReportCollector sẽ tự động:
+   - Thu thập báo cáo từ local
+   - Gửi về central server
+   - Tổ chức theo tên máy: `\\SERVER\Reports\MACHINENAME\`
+   - Dọn dẹp báo cáo cũ (>30 ngày)
+
+3. Xem báo cáo tổng hợp trên server:
+   ```powershell
+   # Liệt kê tất cả máy đã gửi báo cáo
+   Get-ChildItem "\\SERVER\ChanHung\Reports\" | Select-Object Name
+
+   # Xem báo cáo LicenseCheck của một máy
+   Get-ChildItem "\\SERVER\ChanHung\Reports\MACHINENAME\LicenseCheck_*.txt" | 
+       Sort-Object LastWriteTime -Descending | 
+       Select-Object -First 1 | 
+       Get-Content
+   ```
+
+### Cách 4: Tạo script tổng hợp báo cáo
+
+Tạo script `Get-LicenseStatus.ps1` trên central server:
+
+```powershell
+$reportPath = "\\SERVER\ChanHung\Reports"
+$allMachines = Get-ChildItem $reportPath
+
+foreach ($machine in $allMachines) {
+    $latestReport = Get-ChildItem "$($machine.FullName)\LicenseCheck_*.txt" | 
+        Sort-Object LastWriteTime -Descending | 
+        Select-Object -First 1
+    
+    if ($latestReport) {
+        Write-Host "=== $($machine.Name) ===" -ForegroundColor Cyan
+        Write-Host "Last scan: $($latestReport.LastWriteTime)"
+        Get-Content $latestReport.FullName | Select-String "Kết quả|Crack|Cảnh báo"
+        Write-Host ""
+    }
+}
+```
+
 ## Cấu hình Thời gian Kiểm tra
 
 Mặc định: 15 phút
