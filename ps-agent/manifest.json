@@ -1,0 +1,37 @@
+{
+  "version": "1.0.0",
+  "lastUpdated": "2026-05-14T10:13:00Z",
+  "modules": {
+    "Module-ITHardening": {
+      "filename": "Module-ITHardening.ps1",
+      "version": "1.0.0",
+      "sha256": "0134280241AD908FB9EBF10C5054A6B5E5DE1986B051F59824C3B6E2E96055FE",
+      "description": "IT Hardening: Security, IP Static, Reporting",
+      "enabled": true,
+      "priority": "high",
+      "target": "*"
+    },
+    "Module-BlockBrowserDownloads": {
+      "filename": "Module-BlockBrowserDownloads.ps1",
+      "version": "1.0.0",
+      "sha256": "814709dfe1fe2a8484c05de34572a8a1a9a1ac6a5ea67c63d26a86a169cba385",
+      "description": "Chặn tải xuống file từ trình duyệt",
+      "enabled": false,
+      "priority": "medium",
+      "target": "*"
+    },
+    "Module-USBControl": {
+      "filename": "Module-USBControl.ps1",
+      "version": "1.0.0",
+      "sha256": "a0daef34cd983b9db9d7f72bd2e52a0edeff73d437797520686b3a788c00b9ac",
+      "description": "Kiểm soát thiết bị USB",
+      "enabled": false,
+      "priority": "medium",
+      "target": "*"
+    }
+  },
+  "commands": {
+    "emergency": [],
+    "scheduled": []
+  }
+}

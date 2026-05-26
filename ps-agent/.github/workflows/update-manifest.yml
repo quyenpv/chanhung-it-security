@@ -1,0 +1,62 @@
+name: Update Manifest SHA256
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'modules/**/*.ps1'
+  workflow_dispatch:
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Calculate SHA256 for modules
+        id: calculate-sha
+        run: |
+          # Install jq if not available
+          sudo apt-get update && sudo apt-get install -y jq
+          
+          # Read manifest.json
+          MANIFEST=$(cat manifest.json)
+          
+          # Calculate SHA256 for each module
+          for module in modules/*.ps1; do
+            if [ -f "$module" ]; then
+              filename=$(basename "$module")
+              sha256=$(sha256sum "$module" | awk '{print $1}')
+              
+              # Update SHA256 in manifest
+              module_name=$(echo "$filename" | sed 's/.ps1$//')
+              MANIFEST=$(echo "$MANIFEST" | jq --arg name "$module_name" --arg sha "$sha256" '.modules[$name].sha256 = $sha')
+              
+              echo "Updated $module_name: $sha256"
+            fi
+          done
+          
+          # Update lastUpdated timestamp
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          MANIFEST=$(echo "$MANIFEST" | jq --arg ts "$timestamp" '.lastUpdated = $ts')
+          
+          # Write back to manifest.json
+          echo "$MANIFEST" > manifest.json
+          
+          echo "manifest_updated=true" >> $GITHUB_OUTPUT
+          
+      - name: Commit and push manifest
+        if: steps.calculate-sha.outputs.manifest_updated == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add manifest.json
+          git diff --staged --quiet || git commit -m "chore: auto-update manifest SHA256"
+          git push
