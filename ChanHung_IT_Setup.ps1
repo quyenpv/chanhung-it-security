@@ -595,11 +595,10 @@ function Invoke-LicenseCheck {
     Write-Step "BƯỚC 4: Kiểm tra bản quyền phần mềm"
 
     $LC = @{
-        LogPath      = "C:\ChanHung\Logs\LicenseCheck.log"
-        ReportPath   = "C:\ChanHung\Logs\LicenseReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        LogPath    = "C:\ChanHung\Logs\LicenseCheck.log"
+        ReportPath = "C:\ChanHung\Logs\LicenseReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
     }
 
-    # Tạo thư mục log
     $logDir = Split-Path $LC.LogPath
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory $logDir -Force | Out-Null }
 
@@ -608,16 +607,165 @@ function Invoke-LicenseCheck {
         $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')][$Level] $Msg"
         Add-Content $LC.LogPath $line -Encoding UTF8
         $col = switch ($Level) {
-            "OK"     { "Green" }
-            "WARN"   { "Yellow" }
-            "CRACK"  { "Red" }
-            "INFO"   { "Cyan" }
-            default  { "White" }
+            "OK"    { "Green" }
+            "WARN"  { "Yellow" }
+            "CRACK" { "Red" }
+            "INFO"  { "Cyan" }
+            default { "White" }
         }
         Write-Host "    [$Level] $Msg" -ForegroundColor $col
     }
 
-    # Tên / pattern các tool crack phổ biến
+    function Add-Finding {
+        param(
+            [System.Collections.Generic.List[object]]$List,
+            [string]$Name,
+            [string]$Type,
+            [string]$Risk,
+            [string]$Detail
+        )
+        $List.Add([PSCustomObject]@{
+            Name   = $Name
+            Type   = $Type
+            Risk   = $Risk
+            Detail = $Detail
+        }) | Out-Null
+    }
+
+    function Test-LocalKmsEndpoint {
+        param([string]$Ip, [string]$HostName)
+        $ipNorm = if ($Ip) { $Ip.Trim() } else { "" }
+        $hostNorm = if ($HostName) { $HostName.Trim().ToLower() } else { "" }
+        if ($ipNorm -in @("127.0.0.1", "::1", "0.0.0.0")) { return $true }
+        if ($hostNorm -match '^(localhost|127\.0\.0\.1|::1)$') { return $true }
+        if ($hostNorm -and ($hostNorm -eq $env:COMPUTERNAME.ToLower())) { return $true }
+        return $false
+    }
+
+    function Resolve-KmsHostName {
+        param([string]$HostName, [string]$SlmgrDlv)
+        $hostNorm = if ($HostName) { $HostName.Trim().ToLower() } else { "" }
+        if ($hostNorm) { return $hostNorm }
+        if ($SlmgrDlv -match '(?im)kms machine name(?: from dns)?:\s*(\S+)') {
+            return $Matches[1].Trim().ToLower()
+        }
+        return ""
+    }
+
+    function Get-SuspiciousKmsReason {
+        param(
+            [string]$HostName,
+            [string]$Ip,
+            [string]$SlmgrDlv = "",
+            [string]$Channel = ""
+        )
+        $hostNorm = Resolve-KmsHostName -HostName $HostName -SlmgrDlv $SlmgrDlv
+        if (-not $hostNorm) { return $null }
+        if (Test-LocalKmsEndpoint -Ip $Ip -HostName $hostNorm) { return $null }
+
+        foreach ($blocked in $KnownPirateKmsHosts) {
+            $blockedNorm = $blocked.Trim().ToLower()
+            if ($hostNorm -eq $blockedNorm -or $hostNorm -like "*.$blockedNorm") {
+                return "KMS host crack đã biết: $hostNorm"
+            }
+        }
+        foreach ($pat in $PirateKmsHostPatterns) {
+            if ($hostNorm -match $pat) {
+                return "KMS host khớp pattern crack: $hostNorm"
+            }
+        }
+        if ($Channel -in @('Retail', 'OEM') -and $hostNorm -notmatch '\.(microsoft|windows)\.com$') {
+            return "Kênh $Channel nhưng trỏ KMS bên ngoài ($hostNorm) — không hợp lệ với Retail/OEM"
+        }
+        return $null
+    }
+
+    function Get-SlmgrText {
+        param([string[]]$SlmgrArgs)
+        $slmgr = Join-Path $env:SystemRoot "System32\slmgr.vbs"
+        if (-not (Test-Path $slmgr)) { return $null }
+        try {
+            return (& cscript.exe //nologo $slmgr @SlmgrArgs 2>&1 | Out-String).Trim()
+        } catch { return $null }
+    }
+
+    function Get-WindowsChannelFromText {
+        param([string]$Description, [string]$LicenseFamily, [string]$SlmgrDlv)
+        $blob = "$Description $LicenseFamily $SlmgrDlv".ToUpper()
+        if ($blob -match 'VOLUME_MAK|MAK CHANNEL|\bMAK\b') { return "MAK" }
+        if ($blob -match 'VOLUME_KMS|KMSCLIENT|KMS CLIENT|\bKMS\b') { return "KMS" }
+        if ($blob -match 'RETAIL') { return "Retail" }
+        if ($blob -match 'OEM') { return "OEM" }
+        if ($blob -match 'GVLK') { return "GVLK" }
+        if ($blob -match 'EVAL|TRIAL') { return "Evaluation" }
+        if ($LicenseFamily) { return $LicenseFamily }
+        return "Unknown"
+    }
+
+    function Get-LicenseStatusText {
+        param([int]$Status)
+        switch ($Status) {
+            1 { return "Đã kích hoạt hợp lệ" }
+            2 { return "Đang trong thời gian dùng thử" }
+            3 { return "Đang trong thời gian gia hạn" }
+            4 { return "Kênh không hợp lệ" }
+            5 { return "Đã hết hạn" }
+            6 { return "Tạm ngưng" }
+            default { return "Chưa kích hoạt (Status: $Status)" }
+        }
+    }
+
+    function Find-OsppScript {
+        $roots = @(
+            "${env:ProgramFiles}\Microsoft Office",
+            "${env:ProgramFiles(x86)}\Microsoft Office"
+        )
+        foreach ($root in $roots) {
+            if (-not (Test-Path $root)) { continue }
+            $script = Get-ChildItem $root -Filter "OSPP.VBS" -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($script) { return $script.FullName }
+        }
+        return $null
+    }
+
+    function Get-OsppStatusText {
+        $ospp = Find-OsppScript
+        if (-not $ospp) { return $null }
+        try {
+            return (& cscript.exe //nologo $ospp /dstatus 2>&1 | Out-String).Trim()
+        } catch { return $null }
+    }
+
+    function Parse-OsppProducts {
+        param([string]$Text)
+        if (-not $Text) { return @() }
+        $products = [System.Collections.Generic.List[object]]::new()
+        $blocks = [regex]::Split($Text, '(?=PRODUCT ID:)')
+        foreach ($block in $blocks) {
+            if ($block -notmatch 'PRODUCT ID:') { continue }
+            $name = if ($block -match 'LICENSE NAME:\s*(.+)') { $Matches[1].Trim() } else { "Microsoft Office" }
+            $desc = if ($block -match 'LICENSE DESCRIPTION:\s*(.+)') { $Matches[1].Trim() } else { "" }
+            $status = if ($block -match 'LICENSE STATUS:\s*(.+)') { $Matches[1].Trim() } else { "Unknown" }
+            $kmsHost = if ($block -match 'KMS machine name:\s*(.+)') { $Matches[1].Trim() } else { "" }
+            $kmsIp = if ($block -match 'KMS machine IP address:\s*(.+)') { $Matches[1].Trim() } else { "" }
+            $last5 = if ($block -match 'Last 5 characters of installed product key:\s*(.+)') { $Matches[1].Trim() } else { "" }
+            $channel = Get-WindowsChannelFromText -Description $desc -LicenseFamily "" -SlmgrDlv ""
+            $licensed = ($status -match '^---LICENSED---$|^LICENSED$')
+            $products.Add([PSCustomObject]@{
+                Name          = $name
+                Description   = $desc
+                Channel       = $channel
+                LicenseStatus = $status
+                Licensed      = $licensed
+                PartialKey    = $last5
+                KmsServer     = if ($kmsHost) { $kmsHost } else { $kmsIp }
+                KmsIp         = $kmsIp
+            }) | Out-Null
+        }
+        return @($products)
+    }
+
     $KnownCrackTools = @(
         "KMSPico", "KMSAuto", "KMSActivator", "KMS_VL_ALL",
         "AutoKMS", "MiniKMS", "KMSOffline", "KMSELDI",
@@ -633,7 +781,6 @@ function Invoke-LicenseCheck {
         "Defender Control", "Defender Remover", "Kill Defender"
     )
 
-    # Tên file crack thường gặp
     $SuspiciousFileNames = @(
         "crack.exe", "keygen.exe", "patch.exe", "loader.exe",
         "activator.exe", "bypass.exe", "unlocker.exe",
@@ -641,7 +788,24 @@ function Invoke-LicenseCheck {
         "crack.dll", "patch.dll"
     )
 
-    # Registry keys của crack tools
+    $KnownPirateKmsHosts = @(
+        "kms.loli.best",
+        "kms.digiboy.ir",
+        "kms.chinancce.com",
+        "kms8.msoffice365.com",
+        "kms.srv.crsoo.com",
+        "kms.03k.org",
+        "kms.luody.info",
+        "zhuxiaole.com",
+        "kmscat.com"
+    )
+    $PirateKmsHostPatterns = @(
+        '(?i)(^|\.)loli\.best$',
+        '(?i)(^|\.)digiboy\.ir$',
+        '(?i)(kmspico|kmsauto|massgrave|hwid\.|nvl\.app|kms\.srv)',
+        '(?i)^kms[0-9]*\.(pub|pi|lol|best|info|org|net|cn|cc)$'
+    )
+
     $CrackRegistryKeys = @(
         "HKLM:\SOFTWARE\KMSAuto",
         "HKLM:\SOFTWARE\KMSPico",
@@ -652,17 +816,22 @@ function Invoke-LicenseCheck {
         "HKLM:\SYSTEM\CurrentControlSet\Services\KMSAuto"
     )
 
-    # Lớp 1: Phát hiện tool crack
-    Write-LCLog "--- LỚP 1: Kiểm tra tool crack đã cài ---" "INFO"
-    $found = @()
+    $MasMarkers = @(
+        "C:\MAS",
+        "C:\Microsoft Activation Scripts",
+        "$env:USERPROFILE\Downloads\MAS"
+    )
 
-    $regPaths = @(
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    # ── Lớp 1: Tool / process / task crack ──
+    Write-LCLog "--- LỚP 1: Kiểm tra tool crack đã cài ---" "INFO"
+    $uninstallPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
-
-    foreach ($path in $regPaths) {
+    foreach ($path in $uninstallPaths) {
         $items = Get-ItemProperty $path -ErrorAction SilentlyContinue
         if (-not $items) { continue }
         foreach ($item in @($items)) {
@@ -670,157 +839,321 @@ function Invoke-LicenseCheck {
             if (-not $name) { continue }
             foreach ($crack in $KnownCrackTools) {
                 if ($name -like "*$crack*") {
-                    $found += [PSCustomObject]@{
-                        Name      = $name
-                        Type      = "CrackTool"
-                        Risk      = "CRACK"
-                        Detail    = "Phần mềm crack đã cài: '$name'"
-                    }
+                    Add-Finding $findings $name "CrackTool" "CRACK" "Phần mềm crack đã cài: '$name'"
                     Write-LCLog "PHÁT HIỆN CRACK TOOL: $name" "CRACK"
                 }
             }
         }
     }
 
-    # Kiểm tra process
-    $procs = Get-Process -ErrorAction SilentlyContinue
-    foreach ($proc in $procs) {
+    foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
         foreach ($crack in $KnownCrackTools) {
             if ($proc.ProcessName -like "*$crack*" -or $proc.MainWindowTitle -like "*$crack*") {
-                $found += [PSCustomObject]@{
-                    Name   = $proc.ProcessName
-                    Type   = "CrackProcess"
-                    Risk   = "CRACK"
-                    Detail = "Process crack đang chạy: '$($proc.ProcessName)'"
-                }
+                Add-Finding $findings $proc.ProcessName "CrackProcess" "CRACK" "Process crack đang chạy: '$($proc.ProcessName)'"
                 Write-LCLog "CRACK TOOL ĐANG CHẠY: $($proc.ProcessName)" "CRACK"
             }
         }
     }
 
-    # Kiểm tra Task Scheduler
-    $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
-        $_.TaskName -match "KMS|AAct|Activat|KMSELDI" -and $_.TaskName -ne "ChanHung-IT-Agent"
-    }
-    foreach ($task in $tasks) {
-        $found += [PSCustomObject]@{
-            Name   = $task.TaskName
-            Type   = "CrackScheduledTask"
-            Risk   = "CRACK"
-            Detail = "Scheduled Task nghi ngờ crack: '$($task.TaskName)'"
-        }
+    foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+        $_.TaskName -match 'KMS|AAct|Activat|KMSELDI|HWID|Massgrave|Microsoft Activation Scripts' -and
+        $_.TaskName -ne "ChanHung-IT-Agent"
+    })) {
+        $taskType = if ($task.TaskName -match 'HWID|Massgrave|Activation Scripts') { "MasScheduledTask" } else { "CrackScheduledTask" }
+        Add-Finding $findings $task.TaskName $taskType "CRACK" "Scheduled Task nghi ngờ crack/activator: '$($task.TaskName)'"
         Write-LCLog "TASK CRACK: $($task.TaskName)" "CRACK"
     }
 
-    if ($found.Count -eq 0) { Write-LCLog "Lớp 1 OK — Không phát hiện crack tool" "OK" }
+    foreach ($marker in $MasMarkers) {
+        if (Test-Path $marker) {
+            Add-Finding $findings $marker "MasFolder" "CRACK" "Thư mục MAS/HWID activator: $marker"
+            Write-LCLog "MAS/HWID MARKER: $marker" "CRACK"
+        }
+    }
 
-    # Lớp 2: Kiểm tra Registry crack
-    Write-LCLog "--- LỚP 2: Kiểm tra registry dấu hiệu crack ---" "INFO"
+    if (@($findings | Where-Object { $_.Type -in @("CrackTool","CrackProcess","CrackScheduledTask","MasScheduledTask","MasFolder") }).Count -eq 0) {
+        Write-LCLog "Lớp 1 OK — Không phát hiện crack tool" "OK"
+    }
+
+    # ── Lớp 2: Registry / hosts / file crack ──
+    Write-LCLog "--- LỚP 2: Registry, hosts & file dấu hiệu crack ---" "INFO"
     foreach ($key in $CrackRegistryKeys) {
         if (Test-Path $key) {
-            $found += [PSCustomObject]@{
-                Name   = $key
-                Type   = "CrackRegistry"
-                Risk   = "CRACK"
-                Detail = "Registry key của crack tool: $key"
-            }
+            Add-Finding $findings $key "CrackRegistry" "CRACK" "Registry key của crack tool: $key"
             Write-LCLog "CRACK REGISTRY: $key" "CRACK"
         }
     }
 
-    # Lớp 3: Kiểm tra kích hoạt Windows & Office
-    Write-LCLog "--- LỚP 3: Kiểm tra kích hoạt Windows & Office ---" "INFO"
-
-    try {
-        $wmi = Get-WmiObject SoftwareLicensingProduct -ErrorAction Stop |
-            Where-Object { $_.Name -like "Windows*" -and $_.PartialProductKey }
-
-        $winStatus = switch ($wmi.LicenseStatus) {
-            1       { "Đã kích hoạt hợp lệ" }
-            2       { "Đang trong thời gian dùng thử" }
-            3       { "Đang trong thời gian gia hạn" }
-            4       { "Kênh không hợp lệ" }
-            5       { "Đã hết hạn" }
-            6       { "Tạm ngưng" }
-            default { "Chưa kích hoạt (Status: $($wmi.LicenseStatus))" }
-        }
-
-        $winRisk = if ($wmi.LicenseStatus -eq 1) { "OK" } else { "WARN" }
-        Write-LCLog "Windows: $winStatus" $winRisk
-
-        if ($wmi.LicenseStatus -ne 1) {
-            $found += [PSCustomObject]@{
-                Name   = "Windows"
-                Type   = "WindowsActivation"
-                Risk   = $winRisk
-                Detail = "Windows chưa kích hoạt hợp lệ: $winStatus"
+    $hostsLines = @(Get-Content "C:\Windows\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue)
+    $hostCrackDomains = @(
+        "lm.licenses.adobe.com", "activate.adobe.com",
+        "practivate.adobe.com", "ereg.adobe.com",
+        "wip.autodesk.com", "register.autodesk.com"
+    )
+    foreach ($line in $hostsLines) {
+        foreach ($domain in $hostCrackDomains) {
+            if ($line -match [regex]::Escape($domain) -and $line -notmatch '^\s*#') {
+                Add-Finding $findings $domain "HostsBlocked" "CRACK" "hosts file chặn domain license: '$line'"
+                Write-LCLog "HOSTS FILE CRACK: $line" "CRACK"
             }
         }
-
-        # Kiểm tra KMS local
-        if ($wmi.DiscoveredKeyManagementServiceMachineIpAddress -eq "127.0.0.1" -or
-            $wmi.DiscoveredKeyManagementServiceMachineName -match "localhost|127.0.0.1") {
-            $found += [PSCustomObject]@{
-                Name   = "Windows KMS Local"
-                Type   = "KMSLocal"
-                Risk   = "CRACK"
-                Detail = "Windows kích hoạt qua KMS LOCAL (dấu hiệu crack điển hình!)"
-            }
-            Write-LCLog "KMS LOCAL PHÁT HIỆN: Windows kích hoạt qua 127.0.0.1!" "CRACK"
-        }
-    } catch {
-        Write-LCLog "Không đọc được trạng thái Windows: $_" "WARN"
     }
 
-    # Office activation
-    try {
-        $officeWmi = Get-WmiObject SoftwareLicensingProduct -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "Microsoft Office*" -and $_.PartialProductKey }
+    foreach ($pattern in $SuspiciousFileNames) {
+        foreach ($dir in @("C:\Program Files", "C:\Program Files (x86)", $env:APPDATA)) {
+            if (-not (Test-Path $dir)) { continue }
+            foreach ($f in @(Get-ChildItem $dir -Filter $pattern -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 3)) {
+                Add-Finding $findings $f.Name "SuspiciousFile" "CRACK" "File crack trong thư mục cài đặt: $($f.FullName)"
+                Write-LCLog "FILE CRACK: $($f.FullName)" "CRACK"
+            }
+        }
+    }
 
-        foreach ($op in $officeWmi) {
-            if ($op.LicenseStatus -ne 1) {
-                $found += [PSCustomObject]@{
-                    Name   = $op.Name
-                    Type   = "OfficeActivation"
-                    Risk   = "WARN"
-                    Detail = "Office chưa kích hoạt: $($op.Name) (Status: $($op.LicenseStatus))"
+    # ── Lớp 3: Windows activation (WMI + slmgr + SPP registry) ──
+    Write-LCLog "--- LỚP 3: Phân tích bản quyền Windows ---" "INFO"
+
+    $slmgrDlv = Get-SlmgrText @("/dlv")
+    $slmgrXpr = Get-SlmgrText @("/xpr")
+    if ($slmgrDlv) { Write-LCLog "slmgr /dlv: đã thu thập" "INFO" }
+    if ($slmgrXpr) { Write-LCLog "slmgr /xpr: $slmgrXpr" "INFO" }
+
+    $winProduct = $null
+    try {
+        [array]$winCandidates = @(Get-CimInstance -ClassName SoftwareLicensingProduct -ErrorAction Stop |
+            Where-Object { $_.Name -like "Windows*" -and $_.PartialProductKey })
+        if ($winCandidates.Length -gt 0) {
+            $winProduct = $winCandidates | Sort-Object {
+                if ($_.LicenseStatus -eq 1) { 0 } else { 1 }
+            } | Select-Object -First 1
+        }
+    } catch {
+        Write-LCLog "Không đọc được WMI Windows: $_" "WARN"
+    }
+
+    $sppReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform" `
+        -ErrorAction SilentlyContinue
+    $sppKmsName = if ($sppReg) { Get-RegProp $sppReg 'KeyManagementServiceName' } else { "" }
+    $sppKmsPort = if ($sppReg) { Get-RegProp $sppReg 'KeyManagementServiceListeningPort' } else { "" }
+
+    $winChannel = "Unknown"
+    $winStatusCode = 0
+    $winStatusText = "Không xác định"
+    $winKmsServer = ""
+    $winKmsIp = ""
+    $winGenuine = $false
+    $winReason = "Không đọc được trạng thái Windows"
+
+    if ($winProduct) {
+        $winStatusCode = [int]$winProduct.LicenseStatus
+        $winStatusText = Get-LicenseStatusText $winStatusCode
+        $winChannel = Get-WindowsChannelFromText `
+            -Description $winProduct.Description `
+            -LicenseFamily $winProduct.LicenseFamily `
+            -SlmgrDlv $slmgrDlv
+        $winKmsServer = [string]$winProduct.DiscoveredKeyManagementServiceMachineName
+        $winKmsIp = [string]$winProduct.DiscoveredKeyManagementServiceMachineIpAddress
+        if (-not $winKmsServer -and $sppKmsName) { $winKmsServer = $sppKmsName }
+        if (-not $winKmsServer) {
+            $winKmsServer = Resolve-KmsHostName -HostName "" -SlmgrDlv $slmgrDlv
+        }
+
+        Write-LCLog "Windows: $winStatusText | Kênh: $winChannel | KMS: $(if ($winKmsServer) { $winKmsServer } else { 'N/A' })" `
+            $(if ($winStatusCode -eq 1) { "OK" } else { "WARN" })
+
+        $localKms = Test-LocalKmsEndpoint -Ip $winKmsIp -HostName $winKmsServer
+        if ($localKms) {
+            Add-Finding $findings "Windows KMS Local" "KMSLocal" "CRACK" `
+                "Windows kích hoạt qua KMS LOCAL ($winKmsServer / $winKmsIp) — dấu hiệu crack điển hình"
+            Write-LCLog "KMS LOCAL PHÁT HIỆN: Windows → $winKmsServer ($winKmsIp)" "CRACK"
+        }
+
+        $pirateKmsReason = Get-SuspiciousKmsReason -HostName $winKmsServer -Ip $winKmsIp `
+            -SlmgrDlv $slmgrDlv -Channel $winChannel
+        $pirateKms = [bool]$pirateKmsReason
+        if ($pirateKms) {
+            Add-Finding $findings "Windows KMS Remote" "PirateKms" "CRACK" `
+                "Windows trỏ KMS crack/ngoài chuẩn: $pirateKmsReason"
+            Write-LCLog "KMS CRACK/PIRATE: $winKmsServer — $pirateKmsReason" "CRACK"
+        }
+
+        if ($winStatusCode -eq 4) {
+            Add-Finding $findings "Windows" "InvalidChannel" "CRACK" "Windows báo kênh không hợp lệ (LicenseStatus=4)"
+            Write-LCLog "KÊNH KHÔNG HỢP LỆ: Windows LicenseStatus=4" "CRACK"
+        } elseif ($winStatusCode -ne 1) {
+            Add-Finding $findings "Windows" "WindowsActivation" "WARN" "Windows chưa kích hoạt hợp lệ: $winStatusText"
+        }
+
+        if ($winChannel -eq "KMS" -and -not $localKms -and -not $pirateKms -and $winStatusCode -eq 1) {
+            Write-LCLog "KMS doanh nghiệp hợp lệ: $winKmsServer" "OK"
+        }
+
+        if ($slmgrXpr -match 'permanently activated|activated permanently|kích hoạt vĩnh viễn') {
+            $winReason = "slmgr /xpr: kích hoạt vĩnh viễn"
+        } elseif ($slmgrXpr -match 'will expire|hết hạn') {
+            $winReason = "slmgr /xpr: kích hoạt tạm thời — $slmgrXpr"
+            if ($winStatusCode -eq 1 -and $localKms) {
+                Add-Finding $findings "Windows" "KmsExpiry" "CRACK" "Windows KMS tạm thời qua localhost: $slmgrXpr"
+            }
+        }
+
+        $hasCrackSignal = @($findings | Where-Object {
+            $_.Risk -eq "CRACK" -and $_.Type -match 'KMSLocal|PirateKms|InvalidChannel|CrackTool|CrackRegistry|Mas'
+        }).Count -gt 0
+
+        if ($winStatusCode -eq 1 -and -not $hasCrackSignal -and -not $localKms -and -not $pirateKms) {
+            $winGenuine = $true
+            if (-not $winReason) {
+                $winReason = switch ($winChannel) {
+                    "Retail" { "Retail/OEM — LicenseStatus=1, không có dấu hiệu crack" }
+                    "OEM"    { "OEM — LicenseStatus=1, không có dấu hiệu crack" }
+                    "MAK"    { "MAK Volume — LicenseStatus=1" }
+                    "KMS"    { "KMS doanh nghiệp ($winKmsServer) — LicenseStatus=1" }
+                    default  { "LicenseStatus=1, kênh $winChannel" }
                 }
+            }
+        } elseif ($localKms -or $pirateKms -or $hasCrackSignal) {
+            $winGenuine = $false
+            $winReason = if ($pirateKmsReason) { $pirateKmsReason } else { "Nghi crack/KMS emulator — $winStatusText" }
+        } elseif ($winStatusCode -ne 1) {
+            $winGenuine = $false
+            $winReason = $winStatusText
+        } else {
+            $winGenuine = $false
+            $winReason = "Cần xem xét thêm — $winStatusText"
+        }
+    }
+
+    # ── Lớp 4: Office activation (WMI + ospp.vbs) ──
+    Write-LCLog "--- LỚP 4: Phân tích bản quyền Office ---" "INFO"
+
+    $osppText = Get-OsppStatusText
+    $osppProducts = Parse-OsppProducts $osppText
+    $officeResults = [System.Collections.Generic.List[object]]::new()
+
+    if ($osppProducts.Count -gt 0) {
+        Write-LCLog "ospp.vbs: phát hiện $($osppProducts.Count) sản phẩm Office" "INFO"
+    } else {
+        Write-LCLog "ospp.vbs: không có Office hoặc không đọc được" "INFO"
+    }
+
+    try {
+        [array]$officeWmi = @(Get-CimInstance -ClassName SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "Microsoft Office*" -and $_.PartialProductKey })
+    } catch { [array]$officeWmi = @() }
+
+    if ($officeWmi.Length -gt 0 -and $osppProducts.Count -eq 0) {
+        foreach ($op in $officeWmi) {
+            $kmsHost = [string]$op.DiscoveredKeyManagementServiceMachineName
+            $kmsIp = [string]$op.DiscoveredKeyManagementServiceMachineIpAddress
+            $localKms = Test-LocalKmsEndpoint -Ip $kmsIp -HostName $kmsHost
+            $channel = Get-WindowsChannelFromText -Description $op.Description -LicenseFamily $op.LicenseFamily -SlmgrDlv ""
+            $pirateKmsReason = Get-SuspiciousKmsReason -HostName $kmsHost -Ip $kmsIp -Channel $channel
+            $pirateKms = [bool]$pirateKmsReason
+            $licensed = ($op.LicenseStatus -eq 1)
+            $genuine = $licensed -and -not $localKms -and -not $pirateKms
+            $reason = if ($localKms) { "Office KMS LOCAL — nghi crack" }
+                     elseif ($pirateKmsReason) { $pirateKmsReason }
+                     elseif ($licensed) { "LicenseStatus=1" }
+                     else { Get-LicenseStatusText ([int]$op.LicenseStatus) }
+
+            $officeResults.Add([PSCustomObject]@{
+                Name          = $op.Name
+                Channel       = $channel
+                Licensed      = $licensed
+                Genuine       = $genuine
+                Reason        = $reason
+                LicenseStatus = Get-LicenseStatusText ([int]$op.LicenseStatus)
+                KmsServer     = $kmsHost
+            }) | Out-Null
+
+            if ($localKms) {
+                Add-Finding $findings $op.Name "OfficeKMSLocal" "CRACK" "Office kích hoạt qua KMS LOCAL: $($op.Name)"
+                Write-LCLog "OFFICE KMS LOCAL: $($op.Name)" "CRACK"
+            } elseif ($pirateKms) {
+                Add-Finding $findings $op.Name "OfficePirateKms" "CRACK" "Office KMS crack/ngoài chuẩn: $($op.Name) — $pirateKmsReason"
+                Write-LCLog "OFFICE KMS CRACK: $($op.Name) — $pirateKmsReason" "CRACK"
+            } elseif (-not $licensed) {
+                Add-Finding $findings $op.Name "OfficeActivation" "WARN" "Office chưa kích hoạt: $($op.Name)"
                 Write-LCLog "Office chưa kích hoạt: $($op.Name)" "WARN"
             } else {
                 Write-LCLog "Office OK: $($op.Name)" "OK"
             }
+        }
+    } else {
+        foreach ($op in $osppProducts) {
+            $localKms = Test-LocalKmsEndpoint -Ip $op.KmsIp -HostName $op.KmsServer
+            $pirateKmsReason = Get-SuspiciousKmsReason -HostName $op.KmsServer -Ip $op.KmsIp -Channel $op.Channel
+            $pirateKms = [bool]$pirateKmsReason
+            $genuine = $op.Licensed -and -not $localKms -and -not $pirateKms
+            $reason = if ($localKms) { "Office KMS LOCAL — nghi crack" }
+                     elseif ($pirateKmsReason) { $pirateKmsReason }
+                     elseif ($op.Licensed) { "ospp: LICENSED" }
+                     else { $op.LicenseStatus }
 
-            if ($op.DiscoveredKeyManagementServiceMachineIpAddress -eq "127.0.0.1") {
-                $found += [PSCustomObject]@{
-                    Name   = $op.Name
-                    Type   = "OfficeKMSLocal"
-                    Risk   = "CRACK"
-                    Detail = "Office kích hoạt qua KMS LOCAL: $($op.Name)"
-                }
+            $officeResults.Add([PSCustomObject]@{
+                Name          = $op.Name
+                Channel       = $op.Channel
+                Licensed      = $op.Licensed
+                Genuine       = $genuine
+                Reason        = $reason
+                LicenseStatus = $op.LicenseStatus
+                KmsServer     = $op.KmsServer
+            }) | Out-Null
+
+            if ($localKms) {
+                Add-Finding $findings $op.Name "OfficeKMSLocal" "CRACK" "Office kích hoạt qua KMS LOCAL: $($op.Name)"
                 Write-LCLog "OFFICE KMS LOCAL: $($op.Name)" "CRACK"
+            } elseif ($pirateKms) {
+                Add-Finding $findings $op.Name "OfficePirateKms" "CRACK" "Office KMS crack/ngoài chuẩn: $($op.Name) — $pirateKmsReason"
+                Write-LCLog "OFFICE KMS CRACK: $($op.Name) — $pirateKmsReason" "CRACK"
+            } elseif (-not $op.Licensed) {
+                Add-Finding $findings $op.Name "OfficeActivation" "WARN" "Office chưa kích hoạt: $($op.Name) ($($op.LicenseStatus))"
+                Write-LCLog "Office chưa kích hoạt: $($op.Name)" "WARN"
+            } else {
+                Write-LCLog "Office OK: $($op.Name)" "OK"
             }
         }
-    } catch { }
-
-    # Tổng hợp báo cáo
-    $crackCount = @($found | Where-Object Risk -eq "CRACK").Count
-    $warnCount  = @($found | Where-Object Risk -eq "WARN").Count
-
-    $overallRisk = if     ($crackCount -gt 0) { "🔴 CRACK PHÁT HIỆN" }
-                  elseif ($warnCount  -gt 0) { "🟡 CẦN KIỂM TRA" }
-                  else                        { "🟢 HỢP LỆ" }
-
-    $report = [PSCustomObject]@{
-        Computer     = $env:COMPUTERNAME
-        User         = $env:USERNAME
-        ScanTime     = (Get-Date -Format "dd/MM/yyyy HH:mm:ss")
-        OverallRisk  = $overallRisk
-        CrackCount   = $crackCount
-        WarnCount    = $warnCount
-        Findings     = $found
     }
 
-    # Lưu báo cáo
+    # ── Tổng hợp verdict ──
+    $allFindings = @($findings)
+    $crackCount = @($allFindings | Where-Object Risk -eq "CRACK").Count
+    $warnCount  = @($allFindings | Where-Object Risk -eq "WARN").Count
+
+    $officeInstalled = $officeResults.Count -gt 0
+    $officeAllGenuine = (-not $officeInstalled) -or (@($officeResults | Where-Object { -not $_.Genuine }).Count -eq 0)
+
+    $overallVerdict = if ($crackCount -gt 0) { "CRACK_SUSPECTED" }
+                      elseif ($winGenuine -and $officeAllGenuine) { "LICENSED" }
+                      elseif (-not $winGenuine -and $crackCount -eq 0 -and $winStatusCode -in @(0, 2, 5, 6)) { "UNLICENSED" }
+                      elseif (-not $winGenuine -or -not $officeAllGenuine) { "NEEDS_REVIEW" }
+                      else { "NEEDS_REVIEW" }
+
+    $overallRisk = switch ($overallVerdict) {
+        "LICENSED"        { "🟢 HỢP LỆ" }
+        "CRACK_SUSPECTED" { "🔴 CRACK PHÁT HIỆN" }
+        "UNLICENSED"      { "🟡 CHƯA KÍCH HOẠT" }
+        default           { "🟡 CẦN KIỂM TRA" }
+    }
+
+    $report = [PSCustomObject]@{
+        Computer            = $env:COMPUTERNAME
+        User                = $env:USERNAME
+        ScanTime            = (Get-Date -Format "dd/MM/yyyy HH:mm:ss")
+        OverallVerdict      = $overallVerdict
+        OverallRisk         = $overallRisk
+        CrackCount          = $crackCount
+        WarnCount           = $warnCount
+        WindowsChannel      = $winChannel
+        WindowsGenuine      = $winGenuine
+        WindowsGenuineReason= $winReason
+        WindowsLicenseStatus= $winStatusText
+        WindowsKmsServer    = $winKmsServer
+        OfficeProducts      = @($officeResults)
+        Findings            = $allFindings
+    }
+
+    # ── Lưu báo cáo ──
     $sep = "=" * 60
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add($sep)
@@ -828,10 +1161,20 @@ function Invoke-LicenseCheck {
     $lines.Add("  Máy       : $($report.Computer)")
     $lines.Add("  User      : $($report.User)")
     $lines.Add("  Thời gian : $($report.ScanTime)")
+    $lines.Add("  Verdict   : $($report.OverallVerdict)")
     $lines.Add("  Kết quả   : $($report.OverallRisk)")
+    $lines.Add("  Windows   : $($report.WindowsChannel) | Genuine=$($report.WindowsGenuine) | $($report.WindowsGenuineReason)")
     $lines.Add("  Crack     : $($report.CrackCount) phát hiện  |  Cảnh báo: $($report.WarnCount)")
     $lines.Add($sep)
     $lines.Add("")
+
+    if ($report.OfficeProducts.Count -gt 0) {
+        $lines.Add("  OFFICE:")
+        foreach ($op in $report.OfficeProducts) {
+            $lines.Add("    - $($op.Name) | $($op.Channel) | Licensed=$($op.Licensed) | Genuine=$($op.Genuine)")
+        }
+        $lines.Add("")
+    }
 
     if ($report.Findings.Count -eq 0) {
         $lines.Add("  Không phát hiện vấn đề bản quyền.")
@@ -852,11 +1195,18 @@ function Invoke-LicenseCheck {
     $lines.Add($sep)
     $lines | Out-File $LC.ReportPath -Encoding UTF8 -Force
 
+    $boxColor = switch ($report.OverallVerdict) {
+        "CRACK_SUSPECTED" { "Red" }
+        "LICENSED"        { "Green" }
+        default           { "Yellow" }
+    }
+
     Write-Host ""
-    Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor $(
-        if ($report.CrackCount -gt 0) { "Red" } elseif ($report.WarnCount -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "  ╔══════════════════════════════════════════════╗" -ForegroundColor $boxColor
     Write-Host "  ║  KẾT QUẢ KIỂM TRA BẢN QUYỀN                ║"
     Write-Host "  ║  $($report.OverallRisk.PadRight(44))║"
+    Write-Host "  ║  Verdict: $($report.OverallVerdict.PadRight(36))║"
+    Write-Host "  ║  Windows: $($report.WindowsChannel) | Genuine=$($report.WindowsGenuine.ToString().PadRight(15))║"
     Write-Host "  ║  Crack: $($report.CrackCount)  |  Cảnh báo: $($report.WarnCount.ToString().PadRight(24))║"
     Write-Host "  ╚══════════════════════════════════════════════╝"
     Write-Host "  Báo cáo: $($LC.ReportPath)" -ForegroundColor Gray
@@ -872,7 +1222,7 @@ function Invoke-LicenseCheck {
         Write-Host ""
     }
 
-    Write-LCLog "=== HOÀN TẤT: $($report.OverallRisk) | Crack=$($report.CrackCount) Warn=$($report.WarnCount) ==="
+    Write-LCLog "=== HOÀN TẤT: $($report.OverallVerdict) | $($report.OverallRisk) | Crack=$($report.CrackCount) Warn=$($report.WarnCount) ==="
 
     return $report
 }
@@ -1217,13 +1567,16 @@ if ($isExcluded) {
 
 $ipDisplay    = if ($netResult.StaticIPSet) { "✅ $($netResult.IPAddress)".PadRight(22) } else { "⚠️  Giữ cấu hình cũ     " }
 $licenseDisplay = if ($licenseResult) {
-    if ($licenseResult.CrackCount -gt 0) { "🔴 Crack: $($licenseResult.CrackCount)".PadRight(22) }
-    elseif ($licenseResult.WarnCount -gt 0) { "🟡 Cảnh báo: $($licenseResult.WarnCount)".PadRight(22) }
-    else { "✅ Hợp lệ                    " }
+    switch ($licenseResult.OverallVerdict) {
+        "LICENSED"        { "✅ Licensed              " }
+        "CRACK_SUSPECTED" { "🔴 Crack suspected       " }
+        "UNLICENSED"      { "🟡 Chưa kích hoạt       " }
+        default           { "🟡 Cần kiểm tra          " }
+    }
 } elseif ($SkipLicenseCheck) { "⏭️  Bỏ qua                   " } else { "⚠️  Chưa kiểm tra           " }
 $sheetDisplay = if ($sent)           { "✅ Thành công           " } else { "⚠️  Xem log local        " }
 Write-Host "  ║  IP Static          : $ipDisplay║" -ForegroundColor Green
-Write-Host "  ║  Kiểm tra bản quyền : $licenseDisplay║" -ForegroundColor $(if ($licenseResult -and $licenseResult.CrackCount -gt 0) {'Red'} elseif ($licenseResult -and $licenseResult.WarnCount -gt 0) {'Yellow'} else {'Green'})
+Write-Host "  ║  Kiểm tra bản quyền : $licenseDisplay║" -ForegroundColor $(if ($licenseResult) { switch ($licenseResult.OverallVerdict) { 'CRACK_SUSPECTED' {'Red'} 'LICENSED' {'Green'} default {'Yellow'} } } else { 'Green' })
 Write-Host "  ║  Gửi Google Sheets  : $sheetDisplay║" -ForegroundColor Green
 Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""

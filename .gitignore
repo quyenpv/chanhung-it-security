@@ -1,0 +1,16 @@
+﻿.gocache*
+.gocache/
+.gocache2/
+.gocache3/
+.gocache4/
+.gocache5/
+.agent/
+.cursor/
+*.token
+.token
+Token
+deploy/.env
+go-agent/deploy/.env
+go-agent/deploy/secrets/db_password.txt
+*.tmp
+*.log

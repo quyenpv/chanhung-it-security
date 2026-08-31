@@ -564,7 +564,12 @@ function Invoke-AgentNow {
 }
 
 function Get-AgentStatus {
-    $taskExists = Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue
+    $taskExists = $null
+    try {
+        $taskExists = Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue
+    } catch {
+        $taskExists = $null
+    }
     $tokenOK    = $null -ne (Get-AgentToken)
     $verInfo    = if (Test-Path $script:AgentVerFile) {
         Get-Content $script:AgentVerFile | ConvertFrom-Json
@@ -593,6 +598,19 @@ try { Invoke-SelfUpdate } catch { <# bỏ qua lỗi self-update, không block me
 
 Write-Header
 
+# Canh bao neu phien PowerShell HIEN TAI dang bi ket o Constrained Language
+# Mode. __PSLockdownPolicy chi duoc doc 1 lan luc powershell.exe khoi dong,
+# nen neu phien nay khoi dong trong luc may dang KHOA thi du ban chon "Mo
+# khoa" (option 1/3) va sua duoc registry, PHIEN NAY van se o CLM den khi
+# dong cua so va mo lai. Bao truoc de tranh nham lan / crash khong ro ly do.
+if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+    Write-Warn "Phien PowerShell nay dang chay o Constrained Language Mode."
+    Write-Warn "Mot so tinh nang (Agent, dem gio) co the loi/thieu chinh xac."
+    Write-Warn "Neu vua Mo khoa: hay DONG cua so nay va mo PowerShell (Admin) MOI"
+    Write-Warn "  thi phien moi moi nhan Full Language Mode."
+    Write-Host ""
+}
+
 # Hiển thị trạng thái hiện tại chi tiết
 $details    = Get-StatusDetails
 $isLocked   = Get-LockStatus
@@ -616,7 +634,16 @@ Write-Host "  Tổng thể: $overallText" -ForegroundColor $overallColor
 Write-Host ""
 
 # Hiển thị trạng thái Agent ngắn gọn trên menu
-$agentTask = Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue
+# Bọc try/catch: neu module ScheduledTasks khong nap duoc (vi du dang o
+# Constrained Language Mode do lop khoa PS Constrained gay ra), -ErrorAction
+# SilentlyContinue KHONG chan duoc loi "CouldNotAutoloadMatchingModule" vi
+# loi nay xay ra o buoc discover lenh, truoc khi cmdlet duoc goi.
+$agentTask = $null
+try {
+    $agentTask = Get-ScheduledTask -TaskName $script:AgentTaskName -ErrorAction SilentlyContinue
+} catch {
+    $agentTask = $null
+}
 $agentIcon = if ($agentTask) { "[ON] " } else { "[OFF]" }
 $agentCol  = if ($agentTask) { "Green" } else { "DarkYellow" }
 
@@ -638,12 +665,19 @@ $choice = Read-Host "  Lua chon"
 switch ($choice.Trim().ToUpper()) {
     "1" {
         Invoke-Unlock
+        if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+            Write-Warn "Da mo khoa registry, nhung CUA SO PowerShell nay van dang"
+            Write-Warn "  o Constrained Language Mode (chi doi khi mo cua so moi)."
+        }
         Write-Host ""
         Write-Warn "Tu dong khoa lai sau $TimeoutMinutes phut."
         $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
         while ((Get-Date) -lt $endTime) {
-            $rem  = [math]::Round(($endTime - (Get-Date)).TotalSeconds)
-            $mins = [math]::Floor($rem / 60); $secs = $rem % 60
+            # Dung ep kieu [int] thay vi [math]::Round/[math]::Floor: day la
+            # type conversion chu khong phai goi static method, nen van chay
+            # duoc ke ca khi dang o Constrained Language Mode.
+            $rem  = [int](($endTime - (Get-Date)).TotalSeconds)
+            $mins = [int]($rem / 60); $secs = $rem % 60
             Write-Host "`r  [TIMER] Khoa lai sau: ${mins}m ${secs}s   " -NoNewline -ForegroundColor DarkYellow
             Start-Sleep -Seconds 1
         }
@@ -657,6 +691,10 @@ switch ($choice.Trim().ToUpper()) {
     }
     "3" {
         Invoke-Unlock
+        if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+            Write-Warn "Da mo khoa registry, nhung CUA SO PowerShell nay van dang"
+            Write-Warn "  o Constrained Language Mode (chi doi khi mo cua so moi)."
+        }
         Write-Host ""
         Write-Host "  =================================================" -ForegroundColor Green
         Write-Host "  [OK]  MAY DA MO KHOA - cai phan mem di nhe!      " -ForegroundColor Green
